@@ -1,0 +1,48 @@
+{
+  "name": "bufferstack-canopen-core",
+  "version": "1.0.0",
+  "description": "A robust Node.js CANopen library with dynamic EDS parsing, CiA 402 support, and bulletproof physical layer reconnects.",
+  "type": "commonjs",
+  "main": "index.js",
+  "exports": {
+    ".": {
+      "require": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hj91/CANOpen-Core.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hj91/CANOpen-Core/issues"
+  },
+  "homepage": "https://github.com/hj91/CANOpen-Core#readme",
+  "keywords": [
+    "canbus",
+    "canopen",
+    "cia301",
+    "cia402",
+    "socketcan",
+    "slcan",
+    "eds-parser",
+    "iiot",
+    "industrial-automation",
+    "fieldbus",
+    "bufferstack",
+    "Pune",
+    "India"
+  ],
+  "author": "Bufferstack.IO Analytics Technology LLP",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@serialport/parser-readline": "^12.0.0",
+    "serialport": "^12.0.0"
+  },
+  "optionalDependencies": {
+    "rawcan": "1.1.4"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
