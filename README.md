@@ -7,15 +7,15 @@ Bufferstack.IO `canopen-core` provides dynamic EDS (Electronic Data Sheet) parsi
 ## Features
 
 * **Bulletproof Connection Engine:** Built from the ground up to survive physical layer faults. Features an automated exponential backoff and total socket teardown/rebuild pattern to recover from severed cables, network drops, or hardware faults without leaking memory.
-* **Dynamic EDS Mapping:** Never memorize an Object Dictionary index again. Pass in an `.eds` file, and the library builds a flat map of named tags (e.g., `readTag('ControlWord')` instead of `0x6040, sub 0`).
+* **Network Master Class:** Easily multiplex a single physical CAN bus across multiple devices asynchronously without socket locking.
+* **Deterministic Concurrency:** Features bounded FIFO queues for SDO reads and writes to prevent memory leaks on degraded networks during high-frequency telemetry polling.
+* **Dynamic EDS Mapping:** Never memorize an Object Dictionary index again. Pass in an `.eds` file, and the library builds a flat map of named tags (e.g., `readTag('ControlWord')` instead of `0x6040, sub 0`). Includes a highly forgiving parser for non-standard hex suffixes and node ID math.
 * **Hardware Agnostic:** Seamlessly switch between physical transports using a unified API:
-* `socketcan` (Native Linux CAN interfaces like `can0`)
-* `slcan` (Lawicel-protocol USB adapters)
-* `tcp` (Transparent Ethernet-to-CAN gateways)
-* `virtual` (In-memory bus for local testing)
-
-
-* **CiA 402 Support:** Native handling for CiA 402 drive profiles and state machines.
+  * `socketcan` (Native Linux CAN interfaces like `can0`)
+  * `slcan` (Lawicel-protocol USB adapters)
+  * `tcp` (Transparent Ethernet-to-CAN gateways)
+  * `virtual` (In-memory bus for local testing)
+* **CiA 402 Support:** Native handling for CiA 402 drive profiles and state machines via the `CiA402Drive` extension.
 
 ## Installation
 
@@ -29,7 +29,7 @@ npm install bufferstack-canopen-core
 * **Linux Users:** Ensure you have build tools installed (`sudo apt-get install build-essential`).
 * **Windows Users:** Ensure you have the windows build tools installed (`npm install -g windows-build-tools`).
 
-## Quick Start
+## Quick Start (Single Node)
 
 The following example demonstrates how to initialize a device, bind to the connection lifecycle events, and execute application logic using the tag-based API.
 
@@ -96,6 +96,35 @@ async function runMachineLogic() {
 
 ```
 
+## Quick Start (Multi-Node Network)
+
+For systems with multiple devices sharing a single bus, use the `CanopenNetwork` manager to route traffic, and upgrade motor nodes to `CiA402Drive` instances for rapid motion control.
+
+```javascript
+const { CanopenNetwork, CiA402Drive } = require('bufferstack-canopen-core');
+
+const network = new CanopenNetwork({ busType: 'socketcan', interface: 'can0' });
+
+async function runSystem() {
+    await network.connect(); // Opens physical socket ONCE
+
+    // Register devices and upgrade to motion abstraction
+    const axisXConfig = network.addDevice(1, './eds/motor.eds');
+    const axisX = new CiA402Drive(axisXConfig.options);
+    
+    await axisX.connect(); // Attaches to shared socket
+
+    await new Promise(r => setTimeout(r, 1500)); // Wait for OPERATIONAL
+
+    // Execute built-in CiA 402 Machine Logic
+    await axisX.powerOn(); 
+    await axisX.writeTag('TargetVelocity', 1500); 
+}
+
+runSystem();
+
+```
+
 ## API Reference
 
 ### `new CanopenDevice(options)`
@@ -103,7 +132,7 @@ async function runMachineLogic() {
 Creates a new device instance.
 
 * `options.nodeId` (Number): The hardware Node ID (1-127). **Required**.
-* `options.busType` (String): `'socketcan'`, `'slcan'`, `'tcp'`, or `'virtual'`. **Required**.
+* `options.busType` (String): `'socketcan'`, `'slcan'`, `'tcp'`, or `'virtual'`. **Required** (unless using `sharedBus`).
 * `options.edsFile` (String): Path to the device's EDS file.
 * `options.heartbeatMs` (Number): Expected heartbeat interval in milliseconds. Default `3000`.
 * `options.interface` (String): OS interface name (e.g., `'can0'`). Required for `socketcan`.
@@ -111,6 +140,10 @@ Creates a new device instance.
 * `options.tcpHost` (String): IP address of the CAN gateway. Required for `tcp`.
 * `options.tcpPort` (Number): Port of the CAN gateway. Required for `tcp`.
 * `options.baudRate` (Number): Serial baud rate. Default `115200`.
+* `options.autoResetOnHeartbeatLoss` (Boolean): If true, autonomously sends an NMT reset to the node if its heartbeat drops. Default `false`.
+* `options.bootUpSelfStart` (Boolean): If true, the node automatically transitions to OPERATIONAL on boot. Default `true`.
+* `options.maxSdoQueueDepth` (Number): Maximum allowed pending SDO operations before rejecting. Default `100`.
+* `options.sharedBus` (Object): An existing bus instance provided by `CanopenNetwork`.
 
 ### `device.connect()`
 
@@ -139,6 +172,41 @@ Safely halts the CANopen node state machine, closes the physical bus socket, and
 * Returns: `Array<String>`
 * Returns a flat array of all valid string tags parsed from the provided EDS file, which can be passed to `readTag()` and `writeTag()`.
 
+### `device.sendTPDO(pdoNumber, dataBuffer)`
+
+* `pdoNumber` (Number): 1-4.
+* `dataBuffer` (Array/Buffer): The raw payload to broadcast.
+
+### `device.registerRPDO(pdoNumber, callbackOrCobId)`
+
+Registers an RPDO channel to capture incoming broadcast data.
+
+### `device.nmtStart(targetNodeId)`, `nmtStop()`, `nmtReset()`
+
+Issues targeted NMT master commands. Target `0` to broadcast to all nodes.
+
+---
+
+### `new CanopenNetwork(options)`
+
+Creates a central manager for a physical CAN bus. Accepts the same connection `options` as `CanopenDevice`.
+
+* `network.connect()`, `network.disconnect()`: Lifecycle and physical socket management.
+* `network.addDevice(nodeId, edsFile, deviceOptions)`: Registers a node on the network and returns the configuration block.
+* `network.nmtStartAll()`, `nmtStopAll()`, `nmtResetAll()`, `nmtPreOpAll()`: Executes NMT broadcast commands across the entire network.
+
+---
+
+### `new CiA402Drive(options)`
+
+Extends `CanopenDevice` with high-level motion control abstractions.
+
+* `drive.powerOn()`: Executes the CiA 402 power-up sequence (Fault Reset -> Ready to Switch On -> Switched On -> Operation Enabled).
+* `drive.quickStop()`: Triggers a rapid deceleration fault state.
+* `drive.powerOff()`: Drops the power stage.
+* `drive.setMode(modeId)`: Changes the CiA 402 operation mode (e.g., 1 = Profile Position, 3 = Profile Velocity).
+* `drive.getDriveState()`: Parses the drive's Statusword into a human-readable state string.
+
 ## License
 
 This project is licensed under the **Apache License 2.0**. See the LICENSE file for details.
@@ -146,3 +214,4 @@ This project is licensed under the **Apache License 2.0**. See the LICENSE file 
 ## Author
 
 © 2026 Bufferstack.IO Analytics Technology LLP
+
