@@ -20,7 +20,7 @@ Bufferstack.IO `canopen-core` provides dynamic EDS (Electronic Data Sheet) parsi
 ## Installation
 
 ```bash
-npm install canopen-core
+npm install bufferstack-canopen-core
 
 ```
 
