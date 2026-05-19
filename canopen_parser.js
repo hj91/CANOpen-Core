@@ -141,7 +141,6 @@ function parsePDO(canId, data) {
     pdoName:   `${dir}${pdoNum}`,
     dlc:       data.length,
     rawBytes:  Array.from(data).map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`),
-    // Actual signal decoding requires EDS mapping — add mapPDO() below
   };
 }
 
@@ -180,16 +179,9 @@ function parseSYNC_TIME(canId, data) {
 }
 
 // ─── Main Entry: parseFrame() ─────────────────────────────────────────────────
-/**
- * Parse a raw CAN frame into a structured CANopen message.
- * @param {number} canId  - 11-bit CAN identifier
- * @param {Buffer} data   - CAN data bytes (0-8 bytes)
- * @returns {object}      - Parsed CANopen message
- */
 function parseFrame(canId, data) {
   const header  = decodeCanId(canId);
   const base    = { ...header, timestamp: Date.now() };
-
 
   switch (header.msgType) {
     case 'NMT':
@@ -216,9 +208,6 @@ function parseFrame(canId, data) {
     case 'HEARTBEAT':
       return { ...base, payload: parseHeartbeat(data) };
 
-    case 'SYNC_TIME':
-      return { ...base, payload: parseSYNC_TIME(canId, data) };
-
     default:
       if (canId === 0x080) // EMCY uses 0x080+nodeId
         return { ...base, msgType: 'EMCY', payload: parseEMCY(data) };
@@ -227,14 +216,6 @@ function parseFrame(canId, data) {
 }
 
 // ─── PDO Signal Mapper (EDS-driven) ──────────────────────────────────────────
-/**
- * Map raw PDO bytes to named signals using an EDS-style mapping definition.
- * @param {Buffer} data       - Raw PDO bytes
- * @param {Array}  mapping    - Array of signal definitions from EDS
- *
- * mapping entry: { name, bitOffset, bitLength, scale, offset, signed }
- * Example: { name: 'ActualPosition', bitOffset: 0, bitLength: 32, scale: 1, offset: 0, signed: true }
- */
 function mapPDOSignals(data, mapping) {
   const result = {};
   const buf    = Buffer.isBuffer(data) ? data : Buffer.from(data);

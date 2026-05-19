@@ -3,13 +3,6 @@
  * canopen_bus.js  v6
  * ─────────────────────────────────────────────────────────────────────────────
  * Universal hardware transport layer for CANopen gateway.
- * Exposes a unified API regardless of the underlying physical adapter:
- * * VirtualCANBus   – in-process event bus (Desktop dev / simulator)
- * * SocketCANBus    – Linux native socketcan (can0, can1)
- * * USRSerialBus    – USR-CAN114 over RS485/serial (COM port)
- * * TCPCANBus       – Ethernet to CAN (Raw TCP socket)
- * * SLCANBus        – Lawicel / CANable over USB (COM port)
- * ─────────────────────────────────────────────────────────────────────────────
  */
 
 const EventEmitter = require('events');
@@ -77,8 +70,13 @@ class VirtualCANBus extends EventEmitter {
     this.interfaceName = interfaceName;
     this.statsData = { rx: 0, tx: 0, err: 0 };
   }
-  connect() {
-    setTimeout(() => this.emit('bus_connected'), 100);
+  async connect() {
+    return new Promise((resolve) => {
+      setTimeout(() => {
+        this.emit('bus_connected');
+        resolve();
+      }, 100);
+    });
   }
   send(canId, data) {
     this.statsData.tx++;
