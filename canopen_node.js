@@ -56,6 +56,7 @@ class CANopenNode {
         this._heartbeatTimer = null;
         this._onStatusChange = null;
 
+        this._sdoQueues   = new Map(); 
         this._pendingSDO  = new Map();
         this._segTx       = null;   // SDO server segmented upload state
         this._rpdoCobIds  = new Map();
@@ -122,14 +123,19 @@ class CANopenNode {
     start() {
         this._sendBootup();
         this._setState(NMT_STATES.PRE_OPERATIONAL);
-        setTimeout(() => {
+        this._setNodeStatus(NODE_STATUS.PRE_OPERATIONAL);
+
+        if (this._config.bootUpSelfStart) {
             this._setState(NMT_STATES.OPERATIONAL);
             this._setNodeStatus(NODE_STATUS.OPERATIONAL);
             this._startHeartbeat();
             this._resetHeartbeatWatchdog();
-            this.startSyncProducer(); // Launch with pre-configured OD value
+            this.startSyncProducer();
             this.onOperational();
-        }, 200);
+        } else {
+            this._startHeartbeat();
+            this._resetHeartbeatWatchdog();
+        }
     }
 
     _setState(s) { this.nmtState = s; }
@@ -147,11 +153,15 @@ class CANopenNode {
         clearTimeout(this._heartbeatTimer);
         const hb1 = this.od[0x1016] && this.od[0x1016][1] ? this.od[0x1016][1].value : 0;
         const ms  = (hb1 & 0xFFFF) || this._config.heartbeat_timeout_ms || 5000;
+        
         this._heartbeatTimer = setTimeout(() => {
             this._setNodeStatus(NODE_STATUS.OFFLINE);
             console.error(`[NODE ${this.nodeId}] Heartbeat timeout — OFFLINE (no HB for ${ms}ms)`);
-            if (this._config.auto_reset_on_timeout !== false) {
+            
+            if (this._config.autoResetOnHeartbeatLoss) {
                 this.bus.send(0x000, [0x81, this.nodeId]);
+            } else {
+                console.warn(`[CANopen] Heartbeat lost for node ${this.nodeId}. Auto-reset disabled.`);
             }
         }, ms);
     }
@@ -171,7 +181,6 @@ class CANopenNode {
     startSyncProducer(intervalMs) {
         this.stopSyncProducer();
         
-        // If an interval is passed, update the OD (converted to microseconds)
         if (intervalMs !== undefined && intervalMs > 0) {
             if (!this.od[0x1006]) this.od[0x1006] = { 0: { name: 'CommCyclePeriod', value: 0 } };
             this.od[0x1006][0].value = intervalMs * 1000; 
@@ -283,12 +292,45 @@ class CANopenNode {
         this.bus.send(0x580 + this.nodeId, resp);
     }
 
-    // ─── SDO Client ───────────────────────────────────────────────────────────
+    // ─── SDO Client / Queuing ──────────────────────────────────────────────────
+    _processSdoQueue(nodeId) {
+        if (this._pendingSDO.has(nodeId)) return; 
+
+        const queue = this._sdoQueues.get(nodeId);
+        if (!queue || queue.length === 0) return;
+
+        const task = queue.shift();
+        
+        if (task.type === 'read') {
+            this._executeSdoRead(nodeId, task.index, task.subIndex, task.timeoutMs)
+                .then(res => { task.resolve(res); this._processSdoQueue(nodeId); })
+                .catch(err => { task.reject(err); this._processSdoQueue(nodeId); });
+        } else {
+            this._executeSdoWrite(nodeId, task.index, task.subIndex, task.value, task.timeoutMs)
+                .then(res => { task.resolve(res); this._processSdoQueue(nodeId); })
+                .catch(err => { task.reject(err); this._processSdoQueue(nodeId); });
+        }
+    }
+
     sdoRead(remoteNodeId, index, subIndex, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            if (!this._sdoQueues.has(remoteNodeId)) this._sdoQueues.set(remoteNodeId, []);
+            this._sdoQueues.get(remoteNodeId).push({ type: 'read', index, subIndex, timeoutMs, resolve, reject });
+            this._processSdoQueue(remoteNodeId);
+        });
+    }
+
+    sdoWrite(remoteNodeId, index, subIndex, value, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            if (!this._sdoQueues.has(remoteNodeId)) this._sdoQueues.set(remoteNodeId, []);
+            this._sdoQueues.get(remoteNodeId).push({ type: 'write', index, subIndex, value, timeoutMs, resolve, reject });
+            this._processSdoQueue(remoteNodeId);
+        });
+    }
+
+    _executeSdoRead(remoteNodeId, index, subIndex, timeoutMs) {
         timeoutMs = timeoutMs || this._config.sdo_timeout_ms || 500;
         return new Promise((resolve, reject) => {
-            if (this._pendingSDO.has(remoteNodeId))
-                return reject(new Error(`SDO busy for node ${remoteNodeId}`));
             const timer = setTimeout(() => {
                 this._pendingSDO.delete(remoteNodeId);
                 reject(new Error(`SDO read timeout — node ${remoteNodeId} 0x${index.toString(16).toUpperCase()}[${subIndex}]`));
@@ -298,12 +340,9 @@ class CANopenNode {
         });
     }
 
-    sdoWrite(remoteNodeId, index, subIndex, value, timeoutMs) {
+    _executeSdoWrite(remoteNodeId, index, subIndex, value, timeoutMs) {
         timeoutMs = timeoutMs || this._config.sdo_timeout_ms || 500;
         return new Promise((resolve, reject) => {
-            if (this._pendingSDO.has(remoteNodeId))
-                return reject(new Error(`SDO busy for node ${remoteNodeId}`));
-
             let dataBuf = null;
             if (Buffer.isBuffer(value))       dataBuf = value;
             else if (typeof value === 'string') dataBuf = Buffer.from(value, 'utf8');
@@ -338,7 +377,17 @@ class CANopenNode {
                 } else {
                     frame[0] = 0x23;
                     frame[1] = index & 0xFF; frame[2] = (index >> 8) & 0xFF; frame[3] = subIndex;
-                    frame.writeInt32LE((value !== null && value !== undefined) ? (value >>> 0) : 0, 4);
+                    
+                    // FIXED: Properly handle signed vs unsigned integers
+                    if (value !== null && value !== undefined) {
+                        if (value < 0) {
+                            frame.writeInt32LE(value, 4);
+                        } else {
+                            frame.writeUInt32LE(value >>> 0, 4);
+                        }
+                    } else {
+                        frame.writeInt32LE(0, 4);
+                    }
                 }
                 this.bus.send(0x600 + remoteNodeId, frame);
             }
@@ -615,8 +664,8 @@ class CANopenNode {
         this._timers = [];
         this._pendingSDO.forEach(p => { clearTimeout(p.timer); p.reject(new Error('Node stopped')); });
         this._pendingSDO.clear();
+        this._sdoQueues.clear();
     }
 }
 
-// Fixed Export Array
 module.exports = { CANopenNode, NMT_STATES, NODE_STATUS, CIA402_STATES, decodeCIA402State, CIA402_MODES };
