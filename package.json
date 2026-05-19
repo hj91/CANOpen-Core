@@ -1,6 +1,6 @@
 {
   "name": "bufferstack-canopen-core",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "A robust Node.js CANopen library with dynamic EDS parsing, CiA 402 support, and bulletproof physical layer reconnects.",
   "type": "commonjs",
   "main": "index.js",
