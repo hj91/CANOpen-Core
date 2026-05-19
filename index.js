@@ -1,6 +1,20 @@
 /**
  * Bufferstack.IO CANOpen Core - A robust Node.js CANopen library with dynamic EDS parsing,
  * CiA 402 support, and bulletproof physical layer reconnects
+ * Copyright (c) 2026 Bufferstack.IO Analytics Technology LLP
+ * Copyright (c) 2026 Harshad Joshi
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 'use strict';
@@ -16,10 +30,13 @@ class CanopenDevice extends EventEmitter {
         this.nodeId = options.nodeId;
         this.options = options;
         
-        this.bus = null;
+        // Accept an injected bus from CanopenNetwork
+        this.sharedBus = options.sharedBus || null; 
+        this.bus = this.sharedBus;
+        
         this.node = null;
         this.eds = null;
-        this.tagMap = new Map(); // Maps string names to { index, subIndex }
+        this.tagMap = new Map();
         
         this.status = 'DISCONNECTED';
 
@@ -31,7 +48,6 @@ class CanopenDevice extends EventEmitter {
     _loadEds(filePath) {
         this.eds = parseEDS(filePath, this.nodeId);
         
-        // Flatten the EDS Object Dictionary into a searchable Name -> Coordinates map
         for (const [idxStr, subMap] of Object.entries(this.eds.od)) {
             for (const [subStr, entry] of Object.entries(subMap)) {
                 if (entry.name && entry.access !== 'const') {
@@ -54,22 +70,27 @@ class CanopenDevice extends EventEmitter {
         }
     }
 
-    /**
-     * Initializes the connection engine and starts the state machine.
-     */
     async connect() {
-        if (this.bus) this.disconnect();
+        // Only manage bus lifecycle if this is a standalone device
+        if (!this.sharedBus) {
+            if (this.bus) this.disconnect();
 
-        this.bus = createBus({
-            canbus: {
-                type: this.options.busType,
-                interface: this.options.interface,
-                comm_port: this.options.commPort,
-                tcp_host: this.options.tcpHost,
-                tcp_port: this.options.tcpPort,
-                baud_rate: this.options.baudRate || 115200
-            }
-        });
+            this.bus = createBus({
+                canbus: {
+                    type: this.options.busType,
+                    interface: this.options.interface,
+                    comm_port: this.options.commPort,
+                    tcp_host: this.options.tcpHost,
+                    tcp_port: this.options.tcpPort,
+                    baud_rate: this.options.baudRate || 115200
+                }
+            });
+
+            this.bus.on('bus_connected', () => this.emit('connected'));
+            this.bus.on('bus_disconnected', () => this.emit('disconnected'));
+            this.bus.on('bus_reconnecting', (info) => this.emit('reconnecting', info));
+            this.bus.on('bus_error', (err) => this.emit('error', err));
+        }
 
         this.node = new CANopenNode({
             bus: this.bus,
@@ -80,7 +101,8 @@ class CanopenDevice extends EventEmitter {
                 heartbeat_timeout_ms: this.options.heartbeatMs || 3000, 
                 sdo_timeout_ms: 500, 
                 autoResetOnHeartbeatLoss: this.options.autoResetOnHeartbeatLoss ?? false,
-                bootUpSelfStart: true
+                bootUpSelfStart: this.options.bootUpSelfStart ?? true,
+                maxSdoQueueDepth: this.options.maxSdoQueueDepth || 100 
             }
         });
 
@@ -88,19 +110,15 @@ class CanopenDevice extends EventEmitter {
             loadEDSIntoNode(this.node, this.eds);
         }
 
-        // Pass-through connection events
-        this.bus.on('bus_connected', () => this.emit('connected'));
-        this.bus.on('bus_disconnected', () => this.emit('disconnected'));
-        this.bus.on('bus_reconnecting', (info) => this.emit('reconnecting', info));
-        this.bus.on('bus_error', (err) => this.emit('error', err));
-
-        // State Machine Events
         this.node._onStatusChange = (nodeId, newStatus, faultCode) => {
             this.status = newStatus;
             this.emit('status_change', { status: newStatus, faultCode });
         };
 
-        await this.bus.connect();
+        // Only trigger bus connect if standalone
+        if (!this.sharedBus) {
+            await this.bus.connect();
+        }
         
         if (this.status !== 'OFFLINE') {
             this.node.start();
@@ -109,18 +127,17 @@ class CanopenDevice extends EventEmitter {
 
     disconnect() {
         if (this.node) this.node.stop();
-        if (this.bus) this.bus.close();
+        // Don't close the socket if it's owned by the CanopenNetwork
+        if (this.bus && !this.sharedBus) this.bus.close();
         this.status = 'DISCONNECTED';
     }
 
-    // ─── NMT Master Commands ──────────────────────────────────────────────────
     nmtStart(targetNodeId = 0) { this.node.nmtStart(targetNodeId); }
     nmtStop(targetNodeId = 0) { this.node.nmtStop(targetNodeId); }
     nmtReset(targetNodeId = 0) { this.node.nmtReset(targetNodeId); }
     nmtPreOp(targetNodeId = 0) { this.node.nmtPreOp(targetNodeId); }
     nmtResetComm(targetNodeId = 0) { this.node.nmtResetComm(targetNodeId); }
 
-    // ─── PDO Data Handling ────────────────────────────────────────────────────
     sendTPDO(pdoNumber, dataBuffer) {
         this.node.sendTPDO(pdoNumber, dataBuffer);
     }
@@ -128,7 +145,6 @@ class CanopenDevice extends EventEmitter {
         this.node.registerRPDO(pdoNumber, callbackOrCobId);
     }
 
-    // ─── SDO Service Engine ───────────────────────────────────────────────────
     async readTag(tagName) {
         if (!this.node || this.status !== 'OPERATIONAL') {
             throw new Error('Device is not OPERATIONAL');
@@ -158,4 +174,8 @@ class CanopenDevice extends EventEmitter {
     }
 }
 
-module.exports = { CanopenDevice };
+module.exports = { 
+    CanopenDevice,
+    get CanopenNetwork() { return require('./canopen_network').CanopenNetwork; },
+    get CiA402Drive() { return require('./cia402_drive').CiA402Drive; }
+};

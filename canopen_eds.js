@@ -1,33 +1,13 @@
 'use strict';
 /**
- * canopen_eds.js  v1
+ * canopen_eds.js  v2
  * ─────────────────────────────────────────────────────────────────────────────
  * CiA 306 EDS (Electronic Data Sheet) file parser.
- *
- * What it does:
- *   1. Parses .eds files (INI-format, no external dependencies)
- *   2. Builds a full Object Dictionary compatible with CANopenNode.od
- *   3. Extracts TPDO/RPDO signal maps for use with mapPDOSignals()
- *   4. Extracts RPDO COB-IDs for registerRPDO()
- *
- * API:
- *   const eds = parseEDS('servo_drive.eds')
- *   loadEDSIntoNode(node, eds)             populate node.od from EDS
- *   buildSimulatorPDOMaps(eds, nodeId)     returns PDO_MAPS slice for simulator
- *
- * EDS object types (CiA 306):
- *   0x07 = VAR, 0x08 = ARRAY, 0x09 = RECORD
- *
- * EDS data types:
- *   0x0002 = INTEGER8,    0x0003 = INTEGER16,   0x0004 = INTEGER32
- *   0x0005 = UNSIGNED8,   0x0006 = UNSIGNED16,  0x0007 = UNSIGNED32
- *   0x0009 = VISIBLE_STRING
  */
 
 const fs   = require('fs');
 const path = require('path');
 
-// ── Data type → { bitLength, signed } ────────────────────────────────────────
 const DATA_TYPES = {
   0x0001: { bitLength: 1,  signed: false, name: 'BOOLEAN' },
   0x0002: { bitLength: 8,  signed: true,  name: 'INTEGER8' },
@@ -43,7 +23,6 @@ const DATA_TYPES = {
   0x001B: { bitLength: 24, signed: false, name: 'UNSIGNED24' },
 };
 
-// ── Parse .eds INI format into sections ──────────────────────────────────────
 function parseINI(text) {
   const sections = {};
   let current    = null;
@@ -60,50 +39,44 @@ function parseINI(text) {
     if (current && line.includes('=')) {
       const eq  = line.indexOf('=');
       const key = line.slice(0, eq).trim();
-      const val = line.slice(eq + 1).trim().split(';')[0].trim();  // strip inline comments
+      const val = line.slice(eq + 1).trim().split(';')[0].trim();
       sections[current][key] = val;
     }
   }
   return sections;
 }
 
-// ── Parse a numeric string (hex or decimal) ───────────────────────────────────
-/**
- * Parse a numeric string, including $NODEID+0x... expressions.
- * @param {string} s
- * @param {number} [nodeId=0]  substituted for $NODEID
- */
 /**
  * Parse a numeric string, including $NODEID+0x... expressions (CiA 301 §7).
- * @param {string}  s
- * @param {number} [nodeId=0]  value substituted for $NODEID
+ * Forgiving parser: handles standard 0x prefixes and non-standard 'h' suffixes.
  */
 function toNum(s, nodeId) {
   if (!s || s === '') return 0;
   s = s.trim();
+
   if (s.includes('$NODEID')) {
     const id = nodeId || 0;
-    // Substitute the literal $NODEID with the decimal nodeId and evaluate
     const expr = s.replace(/\$NODEID/g, id.toString(10));
-    // Safe eval: only digits, hex, + (no other operators possible in EDS)
     try {
-      const parts = expr.split('+').map(p => p.trim());
+      const cleanExpr = expr.replace(/\s+/g, '');
+      const parts = cleanExpr.split('+');
       return parts.reduce((acc, p) => {
         if (p.startsWith('0x') || p.startsWith('0X')) return acc + parseInt(p, 16);
+        if (p.endsWith('h') || p.endsWith('H')) return acc + parseInt(p.slice(0, -1), 16);
         const n = parseInt(p, 10);
         return acc + (isNaN(n) ? 0 : n);
       }, 0);
     } catch { return id; }
   }
+
   if (s.startsWith('0x') || s.startsWith('0X')) return parseInt(s, 16);
+  if (s.endsWith('h') || s.endsWith('H')) return parseInt(s.slice(0, -1), 16);
   return parseInt(s, 10);
 }
 
-// ── Check if a section name is an OD object (4-char hex) ─────────────────────
 const OD_RE      = /^([0-9A-Fa-f]{4})$/;
 const SUBIDX_RE  = /^([0-9A-Fa-f]{4})sub([0-9A-Fa-f]+)$/i;
 
-// ── Parse a single OD entry from an INI section ───────────────────────────────
 function parseODEntry(sec) {
   return {
     name:        sec.ParameterName  || 'Unknown',
@@ -125,23 +98,10 @@ function parseDefaultValue(raw, dataType) {
   return toNum(raw);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Main: parseEDS
-// ─────────────────────────────────────────────────────────────────────────────
-/**
- * Parse an EDS file and return a structured description.
- * @param {string} filePath   path to the .eds file
- * @returns {EDSData}
- *   .deviceInfo    { vendorName, productName, productCode, ... }
- *   .od            CANopenNode-compatible object dictionary
- *   .tpdoMaps      { 1: { cobId, transmitType, signals }, ... }
- *   .rpdoMaps      { 1: { cobId, signals }, ... }
- */
 function parseEDS(filePath, nodeId) {
   const text     = fs.readFileSync(filePath, 'utf8');
   const ini      = parseINI(text);
 
-  // ── Device info ────────────────────────────────────────────────────────────
   const fi = ini['FileInfo']   || {};
   const di = ini['DeviceInfo'] || {};
   const deviceInfo = {
@@ -154,10 +114,9 @@ function parseEDS(filePath, nodeId) {
     revisionNum: toNum(di.RevisionNumber || '0'),
     orderCode:   di.OrderCode   || '',
     nodeId:      toNum(di.NodeId || '0'),
-    baudRates:   [], // will fill from DeviceInfo flags
+    baudRates:   [],
   };
 
-  // ── Build Object Dictionary ────────────────────────────────────────────────
   const od = {};
   for (const [sectionName, sectionData] of Object.entries(ini)) {
     const odMatch  = OD_RE.exec(sectionName);
@@ -167,11 +126,9 @@ function parseEDS(filePath, nodeId) {
       const index = parseInt(odMatch[1], 16);
       if (!od[index]) od[index] = {};
       const entry = parseODEntry(sectionData);
-      // For VAR (0x07): put in subIndex 0
       if (entry.objectType === 0x07) {
         od[index][0] = { value: entry.value, _raw: sectionData.DefaultValue || '', name: entry.name, dataType: entry.dataType, access: entry.access, pdo: entry.pdo, scaleFactor: entry.scaleFactor, offset: entry.offset };
       } else {
-        // ARRAY/RECORD: store metadata at key '_meta', subindexes filled below
         od[index]._meta = entry;
       }
     } else if (subMatch) {
@@ -183,10 +140,8 @@ function parseEDS(filePath, nodeId) {
     }
   }
 
-  // ── Resolve nodeId for $NODEID expressions ───────────────────────────────
   const nodeIdVal = nodeId || deviceInfo.nodeId || 0;
 
-  // ── Extract TPDO maps (0x1800–0x19FF comm, 0x1A00–0x1BFF mapping) ─────────
   const tpdoMaps = {};
   for (let n = 0; n < 8; n++) {
     const commIdx = 0x1800 + n;
@@ -196,7 +151,7 @@ function parseEDS(filePath, nodeId) {
 
     const rawCobIdVal = od[commIdx][1] && od[commIdx][1]._raw;
     const rawCobId   = rawCobIdVal ? toNum(rawCobIdVal, nodeIdVal) : ((od[commIdx][1] && od[commIdx][1].value) || 0);
-    const cobId      = rawCobId & 0x1FFFFFFF;   // strip valid/RTR bits
+    const cobId      = rawCobId & 0x1FFFFFFF;
     const txType     = (od[commIdx][2] && od[commIdx][2].value) || 0xFF;
     const numMapped  = (od[mapIdx][0]  && od[mapIdx][0].value)  || 0;
 
@@ -212,7 +167,6 @@ function parseEDS(filePath, nodeId) {
       const sigBits     = raw & 0xFF;
       if (sigIndex >= 0x0001 && sigIndex <= 0x0007) { bitOffset += sigBits; continue; }
 
-      // Look up signal name and type in OD
       const sigODEntry = od[sigIndex] && od[sigIndex][sigSubIndex];
       const sigName    = sigODEntry ? sigODEntry.name.replace(/\s+/g, '_') : `Obj_${sigIndex.toString(16).toUpperCase()}_${sigSubIndex}`;
       const dataType   = sigODEntry ? sigODEntry.dataType : 0x0007;
@@ -234,7 +188,6 @@ function parseEDS(filePath, nodeId) {
     tpdoMaps[n + 1] = { cobId, transmitType: txType, signals };
   }
 
-  // ── Extract RPDO maps (0x1400–0x15FF comm, 0x1600–0x17FF mapping) ─────────
   const rpdoMaps = {};
   for (let n = 0; n < 8; n++) {
     const commIdx = 0x1400 + n;
@@ -256,7 +209,7 @@ function parseEDS(filePath, nodeId) {
       const sigIndex    = (raw >>> 16) & 0xFFFF;
       const sigSubIndex = (raw >>>  8) & 0xFF;
       const sigBits     = raw & 0xFF;
-      if (sigIndex >= 0x0001 && sigIndex <= 0x0007) { bitOffset += sigBits; continue; }  // dummy padding
+      if (sigIndex >= 0x0001 && sigIndex <= 0x0007) { bitOffset += sigBits; continue; }
       const sigODEntry  = od[sigIndex] && od[sigIndex][sigSubIndex];
       const sigName     = sigODEntry ? sigODEntry.name.replace(/\s+/g, '_') : `Obj_${sigIndex.toString(16).toUpperCase()}_${sigSubIndex}`;
       const dataType    = sigODEntry ? sigODEntry.dataType : 0x0007;
@@ -278,7 +231,6 @@ function parseEDS(filePath, nodeId) {
     rpdoMaps[n + 1] = { cobId, signals };
   }
 
-  // Remove internal _meta keys from od before returning
   for (const idx of Object.keys(od)) {
     delete od[idx]._meta;
   }
@@ -286,12 +238,6 @@ function parseEDS(filePath, nodeId) {
   return { deviceInfo, od, tpdoMaps, rpdoMaps };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// loadEDSIntoNode(node, eds)
-// Merges EDS-derived OD into a live CANopenNode instance.
-// Only overwrites entries where the EDS defines a value — node's runtime
-// entries (e.g. OD updated by PDO receive) are NOT disturbed.
-// ─────────────────────────────────────────────────────────────────────────────
 function loadEDSIntoNode(node, eds) {
   for (const [indexStr, subMap] of Object.entries(eds.od)) {
     const index = parseInt(indexStr, 10);
@@ -304,7 +250,6 @@ function loadEDSIntoNode(node, eds) {
     }
   }
 
-  // Auto-register RPDOs from EDS
   for (const [numStr, rpdo] of Object.entries(eds.rpdoMaps)) {
     if (rpdo.cobId && rpdo.cobId !== 0x80000000) {
       node.registerRPDO(parseInt(numStr, 10), rpdo.cobId);
@@ -312,11 +257,6 @@ function loadEDSIntoNode(node, eds) {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// buildSimulatorPDOMaps(eds, nodeId)
-// Returns a PDO_MAPS fragment for canopen_simulator.js.
-// The key format matches: `${nodeId}_TPDO${n}`
-// ─────────────────────────────────────────────────────────────────────────────
 function buildSimulatorPDOMaps(eds, nodeId) {
   const maps = {};
   for (const [numStr, tpdo] of Object.entries(eds.tpdoMaps)) {
@@ -334,9 +274,6 @@ function buildSimulatorPDOMaps(eds, nodeId) {
   return maps;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Utility: printEDSSummary(eds)
-// ─────────────────────────────────────────────────────────────────────────────
 function printEDSSummary(eds) {
   const { deviceInfo, tpdoMaps, rpdoMaps, od } = eds;
   console.log(`\n── EDS: ${deviceInfo.fileName} ───────────────────────────────`);

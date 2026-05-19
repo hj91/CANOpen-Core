@@ -1,8 +1,23 @@
 'use strict';
 /**
- * canopen_node.js v6 (Industrial Motion & LSS Edition - Patched)
- * Full CiA 301 base node + CiA 305 LSS Master + CiA 402 Motion profiles.
- * Includes Segmented SDO client (Upload & Download) and Active SYNC Production.
+ * Bufferstack.IO CANOpen Core - A robust Node.js CANopen library with dynamic EDS parsing,
+ * CiA 402 support, and bulletproof physical layer reconnects
+ * Copyright (c) 2026 Bufferstack.IO Analytics Technology LLP
+ * Copyright (c) 2026 Harshad Joshi
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * canopen_node.js v6 
  */
 
 const NMT_STATES  = { INITIALIZING: 0, PRE_OPERATIONAL: 127, OPERATIONAL: 5, STOPPED: 4 };
@@ -58,14 +73,13 @@ class CANopenNode {
 
         this._sdoQueues   = new Map(); 
         this._pendingSDO  = new Map();
-        this._segTx       = null;   // SDO server segmented upload state
+        this._segTx       = null;
         this._rpdoCobIds  = new Map();
         this._errorHistory = [];
         this._syncTimer   = null;
         this._syncCounter = 0;
         this._tpdoMaps    = new Map();
 
-        // ─── Default Object Dictionary (CiA 301 compliant) ───────────────────
         this.od = {
             0x1000: { 0: { value: 0x00000000, name: 'DeviceType' } },
             0x1001: { 0: { value: 0x00,       name: 'ErrorRegister' } },
@@ -98,7 +112,6 @@ class CANopenNode {
         bus.onFrame(frame => this._onFrame(frame));
     }
 
-    // ─── Dynamic TPDO Engine ──────────────────────────────────────────────────
     addTPDOMap(cobId, signals) {
         let offset = 0;
         const mapped = [];
@@ -119,7 +132,6 @@ class CANopenNode {
         this._tpdoMaps.set(cobId, mapped);
     }
 
-    // ─── NMT State Machine ────────────────────────────────────────────────────
     start() {
         this._sendBootup();
         this._setState(NMT_STATES.PRE_OPERATIONAL);
@@ -141,7 +153,6 @@ class CANopenNode {
     _setState(s) { this.nmtState = s; }
     _sendBootup() { this.bus.send(0x700 + this.nodeId, [0x00]); }
 
-    // ─── Heartbeat Logic ──────────────────────────────────────────────────────
     _startHeartbeat() {
         const t = setInterval(() => {
             this.bus.send(0x700 + this.nodeId, [this.nmtState]);
@@ -177,7 +188,6 @@ class CANopenNode {
         return { nodeId: this.nodeId, status: this._nodeStatus, faultCode: this._faultCode };
     }
 
-    // ─── SYNC Producer ────────────────────────────────────────────────────────
     startSyncProducer(intervalMs) {
         this.stopSyncProducer();
         
@@ -216,7 +226,6 @@ class CANopenNode {
         }
     }
 
-    // ─── LSS Master Engine (CiA 305) ──────────────────────────────────────────
     sendLSSSwitchModeGlobal(mode) {
         this.bus.send(0x7E5, [0x04, mode & 0x01, 0, 0, 0, 0, 0, 0]);
     }
@@ -225,7 +234,6 @@ class CANopenNode {
         this.bus.send(0x7E5, [0x11, newNodeId & 0x7F, 0, 0, 0, 0, 0, 0]);
     }
 
-    // ─── SDO Server ───────────────────────────────────────────────────────────
     _handleSDO(data) {
         const cs       = data[0];
         const index    = data.readUInt16LE(1);
@@ -292,7 +300,6 @@ class CANopenNode {
         this.bus.send(0x580 + this.nodeId, resp);
     }
 
-    // ─── SDO Client / Queuing ──────────────────────────────────────────────────
     _processSdoQueue(nodeId) {
         if (this._pendingSDO.has(nodeId)) return; 
 
@@ -315,7 +322,11 @@ class CANopenNode {
     sdoRead(remoteNodeId, index, subIndex, timeoutMs) {
         return new Promise((resolve, reject) => {
             if (!this._sdoQueues.has(remoteNodeId)) this._sdoQueues.set(remoteNodeId, []);
-            this._sdoQueues.get(remoteNodeId).push({ type: 'read', index, subIndex, timeoutMs, resolve, reject });
+            const queue = this._sdoQueues.get(remoteNodeId);
+            const maxDepth = this._config.maxSdoQueueDepth || 100;
+            if (queue.length >= maxDepth) return reject(new Error(`SDO read queue overflow for node ${remoteNodeId}`));
+
+            queue.push({ type: 'read', index, subIndex, timeoutMs, resolve, reject });
             this._processSdoQueue(remoteNodeId);
         });
     }
@@ -323,7 +334,11 @@ class CANopenNode {
     sdoWrite(remoteNodeId, index, subIndex, value, timeoutMs) {
         return new Promise((resolve, reject) => {
             if (!this._sdoQueues.has(remoteNodeId)) this._sdoQueues.set(remoteNodeId, []);
-            this._sdoQueues.get(remoteNodeId).push({ type: 'write', index, subIndex, value, timeoutMs, resolve, reject });
+            const queue = this._sdoQueues.get(remoteNodeId);
+            const maxDepth = this._config.maxSdoQueueDepth || 100;
+            if (queue.length >= maxDepth) return reject(new Error(`SDO write queue overflow for node ${remoteNodeId}`));
+
+            queue.push({ type: 'write', index, subIndex, value, timeoutMs, resolve, reject });
             this._processSdoQueue(remoteNodeId);
         });
     }
@@ -353,7 +368,6 @@ class CANopenNode {
             }, timeoutMs);
 
             if (dataBuf && dataBuf.length > 4) {
-                // Segmented download
                 this._pendingSDO.set(remoteNodeId, {
                     resolve, reject, timer,
                     type: 'write_seg',
@@ -366,7 +380,6 @@ class CANopenNode {
                 init.writeUInt32LE(dataBuf.length, 4);
                 this.bus.send(0x600 + remoteNodeId, init);
             } else {
-                // Expedited download
                 this._pendingSDO.set(remoteNodeId, { resolve, reject, timer, type: 'write' });
                 const frame = Buffer.alloc(8, 0);
                 if (dataBuf) {
@@ -377,8 +390,6 @@ class CANopenNode {
                 } else {
                     frame[0] = 0x23;
                     frame[1] = index & 0xFF; frame[2] = (index >> 8) & 0xFF; frame[3] = subIndex;
-                    
-                    // FIXED: Properly handle signed vs unsigned integers
                     if (value !== null && value !== undefined) {
                         if (value < 0) {
                             frame.writeInt32LE(value, 4);
@@ -394,7 +405,6 @@ class CANopenNode {
         });
     }
 
-    // ─── RPDO / TPDO Helpers ─────────────────────────────────────────────────
     registerRPDO(pdoNum, cobId) {
         if (cobId === undefined) cobId = (pdoNum - 1) * 0x100 + 0x200 + this.nodeId;
         this._rpdoCobIds.set(cobId, pdoNum);
@@ -405,14 +415,12 @@ class CANopenNode {
         this.bus.send(canId, data);
     }
 
-    // ─── Node Guarding (legacy CiA 301) ──────────────────────────────────────
     sendGuardRequest(remoteNodeId) {
         if (typeof this.bus.sendRTR === 'function') {
             this.bus.sendRTR(0x700 + remoteNodeId);
         }
     }
 
-    // ─── EMCY ────────────────────────────────────────────────────────────────
     sendEMCY(errorCode, errorRegister, mfgField = [0, 0, 0, 0, 0]) {
         const cobIdEmcy = (this.od[0x1014] && this.od[0x1014][0])
             ? (this.od[0x1014][0].value & 0x1FFFFFFF)
@@ -437,14 +445,12 @@ class CANopenNode {
 
     getErrorHistory() { return [...this._errorHistory]; }
 
-    // ─── NMT Commands ────────────────────────────────────────────────────────
     nmtStart(targetNodeId   = 0) { this.bus.send(0x000, [0x01, targetNodeId]); }
     nmtStop(targetNodeId    = 0) { this.bus.send(0x000, [0x02, targetNodeId]); }
     nmtReset(targetNodeId   = 0) { this.bus.send(0x000, [0x81, targetNodeId]); }
     nmtPreOp(targetNodeId   = 0) { this.bus.send(0x000, [0x80, targetNodeId]); }
     nmtResetComm(targetNodeId = 0) { this.bus.send(0x000, [0x82, targetNodeId]); }
 
-    // ─── Frame Handler ────────────────────────────────────────────────────────
     _onFrame(frame) {
         const { id, data } = frame;
 
@@ -502,14 +508,12 @@ class CANopenNode {
             return;
         }
 
-        // SDO client (responses from remote nodes)
         if (id >= 0x581 && id <= 0x5FF) {
             const remoteId = id - 0x580;
             const pending  = this._pendingSDO.get(remoteId);
             if (!pending) return;
             const cs = data[0];
 
-            // Abort code always terminates the transfer
             if (cs === 0x80) {
                 clearTimeout(pending.timer);
                 this._pendingSDO.delete(remoteId);
@@ -519,7 +523,6 @@ class CANopenNode {
 
             if (pending.type === 'read') {
                 if (cs === 0x41) {
-                    // Segmented Upload Initiated
                     const totalLen = data.readUInt32LE(4);
                     pending.type = 'read_seg';
                     pending.segData = Buffer.alloc(totalLen);
@@ -527,7 +530,7 @@ class CANopenNode {
                     pending.segToggle = 0;
 
                     const req = Buffer.alloc(8, 0);
-                    req[0] = 0x60; // Request first segment
+                    req[0] = 0x60;
                     this.bus.send(0x600 + remoteId, req);
 
                     clearTimeout(pending.timer);
@@ -537,14 +540,13 @@ class CANopenNode {
                     }, this._config.sdo_timeout_ms || 500);
                     return;
                 } else if (cs === 0x43 || cs === 0x47 || cs === 0x4B || cs === 0x4F || cs === 0x40) {
-                    // Expedited Upload
                     clearTimeout(pending.timer);
                     this._pendingSDO.delete(remoteId);
                     pending.resolve(data.readInt32LE(4));
                     return;
                 }
             } else if (pending.type === 'read_seg') {
-                if ((cs & 0xE0) === 0x00) { // Segment received
+                if ((cs & 0xE0) === 0x00) {
                     const toggle = (cs >> 4) & 0x01;
                     if (toggle !== pending.segToggle) {
                         clearTimeout(pending.timer);
@@ -562,7 +564,7 @@ class CANopenNode {
                     if (last) {
                         clearTimeout(pending.timer);
                         this._pendingSDO.delete(remoteId);
-                        return pending.resolve(pending.segData); // Return full Buffer
+                        return pending.resolve(pending.segData);
                     }
 
                     pending.segToggle ^= 1;
@@ -648,7 +650,6 @@ class CANopenNode {
         }
     }
 
-    // ─── Override hooks ───────────────────────────────────────────────────────
     onOperational() {}
     onRPDO(pdoNum, data) {}
     onTPDO(cobId, data) {}
@@ -656,7 +657,6 @@ class CANopenNode {
     onSYNC(counter) {}
     onTIME(ms, days) {}
 
-    // ─── Teardown ─────────────────────────────────────────────────────────────
     stop() {
         clearTimeout(this._heartbeatTimer);
         this.stopSyncProducer();
